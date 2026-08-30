@@ -1,0 +1,177 @@
+name: 02 - Render
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirm_delete_old_output:
+        description: "Confirm deletion of the previous output Release (old output)"
+        required: true
+        default: "false"
+        type: boolean
+      blur_amount:
+        description: "Blur amount (0-5)"
+        required: false
+        default: "1"
+        type: string
+      quality:
+        description: "x264 CRF quality (lower = better/larger)"
+        required: false
+        default: "23"
+        type: string
+      out_fps:
+        description: "Output frame rate override (e.g. 60). Leave empty = auto"
+        required: false
+        default: ""
+        type: string
+      dry_run:
+        description: "Preview the plan without rendering (reports only)"
+        required: false
+        default: "false"
+        type: boolean
+
+concurrency:
+  group: blur-render
+  cancel-in-progress: false
+
+jobs:
+  render:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Load toolchain from cache
+        uses: actions/cache/restore@v5
+        with:
+          path: runtime
+          key: blur-toolchain-v2.45
+          fail-on-cache-miss: true
+
+      - name: Install runtime tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y ffmpeg jq file
+
+      - name: Confirm deletion of previous output
+        if: inputs.confirm_delete_old_output == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if gh release view "blur-output-${{ github.run_id }}" >/dev/null 2>&1; then
+            gh release delete "blur-output-${{ github.run_id }}" --yes
+            echo "Deleted prior output for this run id (unlikely; id is unique)."
+          fi
+          # Delete any previous published output release
+          PREV=$(gh release list --limit 20 --json tagName --jq '.[]?.tagName | select(startswith("blur-output-"))' 2>/dev/null | head -1)
+          if [ -n "$PREV" ]; then
+            gh release delete "$PREV" --yes
+            echo "Deleted previous output release: $PREV"
+          else
+            echo "No previous output to delete."
+          fi
+
+      - name: Locate freshest successful import
+        id: find
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          RUN_ID=$(gh api "repos/${{ github.repository }}/actions/workflows/01-import-video.yaml/runs?status=success&per_page=1" --jq '.workflow_runs[0].id')
+          if [ -z "$RUN_ID" ] || [ "$RUN_ID" = "null" ]; then
+            echo "::error::No successful 01-import run found. Run 01 first."
+            exit 1
+          fi
+          echo "run_id=$RUN_ID" >> "$GITHUB_OUTPUT"
+          echo "Found import run: $RUN_ID"
+
+      - name: Download input from import run
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          mkdir -p input output
+          gh run download "${{ steps.find.outputs.run_id }}" -R "${{ github.repository }}" -n blur-input -D input
+          ls -lh input/
+
+      - name: Detect input file
+        id: cfg
+        run: |
+          IN_FILE=$(ls input/input.* 2>/dev/null | head -1)
+          if [ -z "$IN_FILE" ]; then
+            echo "::error::No input file found in artifact."
+            exit 1
+          fi
+          echo "infile=$IN_FILE" >> "$GITHUB_OUTPUT"
+          DUR=$(ffprobe -v error -show_entries format=duration -of csv=p=0 "$IN_FILE" 2>/dev/null || echo 0)
+          echo "duration=$DUR" >> "$GITHUB_OUTPUT"
+          echo "Input: $IN_FILE (${DUR}s)"
+
+      - name: Dry-run gate (estimate before committing hours)
+        run: |
+          DUR="${{ steps.cfg.outputs.duration }}"
+          echo "Video duration: ${DUR}s"
+          # ~40x realtime CPU estimate (safe config, no SVP); keep 30min margin under 360 budget.
+          EST=$(awk "BEGIN{printf \"%d\", ${DUR}*40}")
+          echo "Estimated render minutes: $EST (budget 360)"
+          if [ "$EST" -gt 330 ]; then
+            echo "::error::Estimated ${EST}min exceeds safe budget (330min). Re-encode a shorter clip."
+            exit 1
+          fi
+          echo "$EST" > est.txt
+
+      - name: Render (or skip in dry-run)
+        if: inputs.dry_run == 'false'
+        run: |
+          chmod +x runtime/blur-cli
+          cat > render.cfg <<EOF
+blur: true
+blur amount: ${{ inputs.blur_amount }}
+interpolate: false
+deduplicate: false
+gpu decoding: false
+gpu interpolation: false
+gpu encoding: false
+preview: false
+quality: ${{ inputs.quality }}
+video container: mp4
+EOF
+          if [ -n "${{ inputs.out_fps }}" ]; then
+            printf 'blur output fps: %s\n' "${{ inputs.out_fps }}" >> render.cfg
+          fi
+          cat render.cfg
+          runtime/blur-cli -i "${{ steps.cfg.outputs.infile }}" -o output/out.mp4 -c render.cfg -v
+          echo "Output info:"
+          ffprobe -v error -show_entries format=duration,size -of json output/out.mp4
+
+      - name: Validate output
+        if: inputs.dry_run == 'false'
+        run: |
+          test -s output/out.mp4 || { echo "::error::No output produced."; exit 1; }
+          echo "Output OK: $(du -h output/out.mp4 | cut -f1)"
+
+      - name: Upload output artifact (short retention)
+        if: inputs.dry_run == 'false'
+        uses: actions/upload-artifact@v4
+        with:
+          name: blur-output
+          path: output/out.mp4
+          retention-days: 5
+
+      - name: Publish output Release
+        if: inputs.dry_run == 'false'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "blur-output-${{ github.run_id }}" output/out.mp4 \
+            --title "Blur output #${{ github.run_id }}" \
+            --notes "blur amount=${{ inputs.blur_amount }}, quality=${{ inputs.quality }}" \
+            --latest
+          echo "Published release: blur-output-${{ github.run_id }}"
+
+      - name: Write Job Summary
+        run: |
+          {
+            echo "## Render complete"
+            echo "- Amount: ${{ inputs.blur_amount }} | Quality: ${{ inputs.quality }}"
+            echo "- Release: blur-output-${{ github.run_id }}"
+            echo "- Output: $(du -h output/out.mp4 2>/dev/null | cut -f1 || echo 'dry-run, not rendered')"
+          } >> "$GITHUB_STEP_SUMMARY"
