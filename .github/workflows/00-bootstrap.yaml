@@ -42,10 +42,17 @@ jobs:
           curl -s https://api.github.com/repos/f0e/blur/releases/latest | jq -r .tag_name > latest.txt
           echo "Building fork source; upstream latest release: $(cat latest.txt)"
 
+      - name: Set up vcpkg
+        run: |
+          git clone --depth 1 https://github.com/microsoft/vcpkg.git
+          ./vcpkg/bootstrap-vcpkg.sh
+
       - name: Build blur-cli from fork source + assemble stripped runtime
         run: |
           chmod +x .github/scripts/build-cli.sh
           ./.github/scripts/build-cli.sh
+        env:
+          VCPKG_ROOT: ${{ github.workspace }}/vcpkg
 
       - name: Self-test the runtime (pure-blur safe)
         run: |
