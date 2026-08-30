@@ -12,7 +12,7 @@ cd ..
 
 echo "==> Building blur-cli via vcpkg preset (VCPKG_ROOT=$VCPKG_ROOT)"
 cmake --preset linux-release
-cmake --build --preset linux-release
+cmake --build . --preset linux-release
 
 echo "==> Assembling runtime/"
 RUNTIME=runtime
