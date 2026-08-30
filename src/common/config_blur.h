@@ -32,13 +32,18 @@ struct BlurSettings {
 	std::string blur_weighting = "equal";
 	float blur_gamma = 1.f;
 
+	// ponytail: SVP is Win/macOS-only (needs SVP Manager) and useless on a
+	// headless Linux CI runner, so the upstream Linux default (interpolate on,
+	// SVP) is a footgun for CLI use. Default to pure motion blur on Linux so a
+	// bare `blur-cli` run is safe; the `quality` preset re-enables RIFE.
 	bool interpolate = true;
 #ifdef __APPLE__
 	std::string interpolated_fps = "600";
 	std::string interpolation_method = "rife";
 #else
+	bool interpolate = false;
 	std::string interpolated_fps = "1200";
-	std::string interpolation_method = "svp";
+	std::string interpolation_method = "rife";
 #endif
 
 	bool pre_interpolate = false;
@@ -61,15 +66,25 @@ struct BlurSettings {
 #ifdef __APPLE__
 	std::string deduplicate_method = "rife";
 #else
-	std::string deduplicate_method = "svp";
+	// ponytail: matching the interpolate default, dedup (SVP-based) is off by
+	// default on Linux/CI. Enable explicitly when wanted.
+	bool deduplicate = false;
+	std::string deduplicate_method = "rife";
 #endif
 
 	bool preview = true;
 	bool detailed_filenames = false;
 	bool copy_dates = false;
 
+#ifdef __APPLE__
 	bool gpu_decoding = true;
 	bool gpu_interpolation = true;
+#else
+	// ponytail: no real GPU on the CI/headless Linux runner; keep pure blur
+	// CPU-only by default for stability. Overridden per-preset in generated cfg.
+	bool gpu_decoding = false;
+	bool gpu_interpolation = false;
+#endif
 	bool gpu_encoding = false;
 
 	bool override_advanced = false;
