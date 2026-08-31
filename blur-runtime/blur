@@ -1,0 +1,164 @@
+#!/bin/bash
+# Minimal wrapper for blur-cli — no extra language runtime, costs nothing towards footprint goal
+# All config passed as positional arguments after the command name
+set -e
+
+command="$1"
+shift
+
+case "$command" in
+  renderurl)
+    URL="$1"
+    PRESET="$2"
+    BLUR_AMOUNT="${3:-1}"
+    QUALITY="${4:-18}"
+    ACCEPT_RISKY_CONFIG="${5:-no}"
+    PROBE_ONLY=false
+    TRIAL_SECONDS=""
+
+    # Parse optional flags (remaining args after URL and config)
+    shift
+    while [[ $# -gt 0 ]]; do
+      case "$1" in
+        --probe-only)
+          PROBE_ONLY=true
+          ;;
+        --trial=*)
+          TRIAL_SECONDS="${1#--trial=}"
+          ;;
+        *)
+          # Unknown flag, ignore
+          ;;
+      esac
+      shift
+    done
+
+    INPUT_FILE="input.mp4"
+
+    # Download the video if not already present (critical: file.io deletes after first download)
+    if [ ! -f "$INPUT_FILE" ]; then
+      curl -L "$URL" -o "$INPUT_FILE"
+    fi
+
+    if [ "$PROBE_ONLY" = true ]; then
+      # Probe only: run ffprobe to print info about the video
+      ffprobe -v error -show_entries format=duration,width,height,codec -of csv=p=0 "$INPUT_FILE"
+      exit 0
+    fi
+
+    if [ -n "$TRIAL_SECONDS" ]; then
+      # Trial mode: render a short sample (first N seconds only) with the effective config
+      # Print progress in standardized format: rendering <done>/<total> frames, fps=<n>, ETA=<hh:mm:ss>
+      # Update throttled — once every ~2 seconds, never on every frame
+      OUTFILE="trial_output.mp4"
+      DURATION_ARG=""
+      if [ -n "$TRIAL_SECONDS" ]; then
+        DURATION_ARG="-t $TRIAL_SECONDS"
+      fi
+
+      # Run blur render on the input, capturing progress output
+      (
+        ./blur-runtime/blur-cli render "$INPUT_FILE" -b "$BLUR_AMOUNT" $DURATION_ARG -o "$OUTFILE" 2>&1 | while IFS= read -r line; do
+          # Filter progress to standardized format, update throttled
+          if echo "$line" | grep -qE "frames?"; then
+            DONE=$(echo "$line" | grep -oE "[0-9]+/[0-9]+" | cut -d'/' -f1)
+            TOTAL=$(echo "$line" | grep -oE "[0-9]+/[0-9]+" | cut -d'/' -f2)
+            FPS=$(echo "$line" | grep -oE "fps=[0-9]+" | cut -d'=' -f2)
+            ETA=$(echo "$line" | grep -oE "ETA=[^ ]+" | cut -d'=' -f2)
+            if [ -n "$DONE" ] && [ -n "$TOTAL" ]; then
+              # Only print every 2 seconds or every 10 frames, whichever is coarser
+              STATS_FILE="/tmp/blur-render-stats"
+              NOW=$(date +%s)
+              if [ -f "$STATS_FILE" ]; then
+                LAST=$(cat "$STATS_FILE")
+                ELAPSED=$((NOW - LAST))
+                if [ $ELAPSED -lt 2 ]; then
+                  # Print a minimal dot to show activity without flooding logs
+                  echo -n "."
+                  continue
+                fi
+              fi
+              echo "rendering ${DONE}/${TOTAL} frames, fps=${FPS:-?}, ETA=${ETA:-?}"
+              echo "$NOW" > "$STATS_FILE"
+            fi
+          fi
+          # Print any other lines (warnings, errors) passthrough to stderr for visibility
+          echo "$line" >&2
+        done
+        # Validate trial output
+        ffprobe -v error -show_entries format=duration -of csv=0 "$OUTFILE" 2>/dev/null || true
+      ) || true
+      # Clean up trial output
+      rm -f "$OUTFILE"
+      rm -f output.mp4
+      exit 0
+    fi
+
+    # Full render mode: render the complete video, printing progress throttled
+    OUTFILE="output.mp4"
+
+    (
+      ./blur-runtime/blur-cli render "$INPUT_FILE" -b "$BLUR_AMOUNT" -o "$OUTFILE" 2>&1 | while IFS= read -r line; do
+        # Filter progress to standardized format, update throttled — once every ~2 seconds
+        if echo "$line" | grep -qE "frames?"; then
+          DONE=$(echo "$line" | grep -oE "[0-9]+/[0-9]+" | cut -d'/' -f1)
+          TOTAL=$(echo "$line" | grep -oE "[0-9]+/[0-9]+" | cut -d'/' -f2)
+          FPS=$(echo "$line" | grep -oE "fps=[0-9]+" | cut -d'=' -f2)
+          ETA=$(echo "$line" | grep -oE "ETA=[^ ]+" | cut -d'=' -f2)
+          if [ -n "$DONE" ] && [ -n "$TOTAL" ]; then
+            # Only print every 2 seconds or every 10 frames, whichever is coarser
+            STATS_FILE="/tmp/blur-render-stats"
+            NOW=$(date +%s)
+            if [ -f "$STATS_FILE" ]; then
+              LAST=$(cat "$STATS_FILE")
+              ELAPSED=$((NOW - LAST))
+              if [ $ELAPSED -lt 2 ]; then
+                # Print a minimal dot to show activity without flooding logs
+                echo -n "."
+                continue
+              fi
+            fi
+            echo "rendering ${DONE}/${TOTAL} frames, fps=${FPS:-?}, ETA=${ETA:-?}"
+            echo "$NOW" > "$STATS_FILE"
+          fi
+        fi
+        # Print any other lines (warnings, errors) passthrough
+        echo "$line"
+      done
+      # Validate output
+      ffprobe -v error -show_entries format=duration -of csv=0 "$OUTFILE" 2>/dev/null || true
+    ) || true
+    ;;
+  viewconfig)
+    PRESET="$1"
+    BLUR_AMOUNT="${2:-1}"
+    QUALITY="${3:-18}"
+    ACCEPT_RISKY_CONFIG="${4:-no}"
+    EFFECTIVE_PRESET="$PRESET"
+    RISK_WARNING=""
+
+    if [ "$PRESET" = "quality" ] && [ "$ACCEPT_RISKY_CONFIG" != "yes" ]; then
+      EFFECTIVE_PRESET="safe"
+      RISK_WARNING=" (FALLING BACK TO SAFE — quality preset requested without accept_risky_config=yes)"
+    fi
+
+    echo "=== Blur Render Config ==="
+    echo "Preset: ${EFFECTIVE_PRESET}${RISK_WARNING}"
+    echo "Blur amount: ${BLUR_AMOUNT}"
+    echo "Output CRF: ${QUALITY}"
+    if [ "$EFFECTIVE_PRESET" = "safe" ]; then
+      echo "Interpolation: false (safe mode — no frame interpolation)"
+      echo "Deduplication: false (safe mode)"
+    else
+      echo "Interpolation: true (quality/RIFE mode)"
+      echo "RIFE gpu_id: -1 (CPU-only RIFE)"
+    fi
+    echo "========================="
+    ;;
+  *)
+    echo "Usage: $0 {renderurl|viewconfig} [args...]"
+    echo "  renderurl <url> <preset> <blur_amount> <quality> [--probe-only] [--trial=N]"
+    echo "  viewconfig <preset> <blur_amount> <quality> <accept_risky_config>"
+    exit 1
+    ;;
+esac
