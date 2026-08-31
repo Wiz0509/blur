@@ -1,0 +1,1 @@
+$(cat .github/workflows/render.yaml | base64 -w0)
